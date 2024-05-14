@@ -14,6 +14,13 @@ function rtrim(str: string): string {
   return str.replace(/\s*$/g, "");
 }
 
+function toWindows(inputArray: Array, size: number): Array {
+  return Array.from(
+      { length: inputArray.length - (size - 1) }, //get the appropriate length
+      (_, index) => inputArray.slice(index, index + size) //create the windows
+  );
+}
+
 export function tagFromNumbers(group: number, element: number): Tag {
   return new Tag(((group << 16) | element) >>> 0);
 }
@@ -325,52 +332,96 @@ export class BinaryRepresentation extends ValueRepresentation<ArrayBuffer> {
     syntax: NormalizedSyntax,
     isEncapsulated: boolean
   ): number {
+
+    var fragmentMultiframe = true;
+    //value = value === null || value === undefined ? [] : value;
+
+    // Encapulated in this respect means we're using a comression codec.
+    // https://dicom.nema.org/dicom/2013/output/chtml/part05/sect_8.2.html
     if (isEncapsulated) {
+      // Not sure why this is the fragment size...
       var fragmentSize = 1024 * 20,
         frames = value.length;
       let startOffset: Array<number> = [];
 
+      // Calculate a total length for storing binary stream
+      var bufferLength = 0;
+      for (i = 0; i < frames; i++) {
+          const needsPadding = Boolean(value[i].byteLength & 1);
+          bufferLength += value[i].byteLength + (needsPadding ? 1 : 0);
+          let fragmentsLength = 1;
+          if (fragmentMultiframe) {
+              fragmentsLength = Math.ceil(
+                  value[i].byteLength / fragmentSize
+              );
+          }
+          // 8 bytes per fragment are needed to store 0xffff (2 bytes), 0xe000 (2 bytes), and frageStream size (4 bytes)
+          bufferLength += fragmentsLength * 8;
+      }
+
       var binaryStream: BufferStream = new WriteBufferStream(
-        1024 * 1024 * 20,
+        bufferLength,
         stream.isLittleEndian
       );
+
+      // Go through the frames and add to the stream
       for (var i = 0; i < frames; i++) {
+        const needsPadding = Boolean(value[i].byteLength & 1);
+
         startOffset.push(binaryStream.size);
-        var frameBuffer = value[i],
-          frameStream = new ReadBufferStream(frameBuffer),
-          fragmentsLength = Math.ceil(frameStream.size / fragmentSize);
+            var frameBuffer = value[i],
+                frameStream = new ReadBufferStream(frameBuffer);
+
+        var fragmentsLength = 1;
+        if (fragmentMultiframe) {
+            fragmentsLength = Math.ceil(
+                frameStream.size / fragmentSize
+            );
+        }
+
         for (var j = 0, fragmentStart = 0; j < fragmentsLength; j++) {
-          var fragmentEnd = fragmentStart + fragmentSize;
-          if (j == fragmentsLength - 1) {
-            fragmentEnd = frameStream.size;
+          const isFinalFragment = j === fragmentsLength - 1;
+
+          var fragmentEnd = fragmentStart + frameStream.size;
+          if (fragmentMultiframe) {
+              fragmentEnd = fragmentStart + fragmentSize;
+          }
+          if (isFinalFragment) {
+              fragmentEnd = frameStream.size;
           }
           var fragStream = new ReadBufferStream(
-            frameStream.getBuffer(fragmentStart, fragmentEnd)
+              frameStream.getBuffer(fragmentStart, fragmentEnd)
           );
           fragmentStart = fragmentEnd;
           binaryStream.writeUint16(0xfffe);
           binaryStream.writeUint16(0xe000);
-          binaryStream.writeUint32(fragStream.size);
+
+          const addPaddingByte = isFinalFragment && needsPadding;
+
+          binaryStream.writeUint32(
+              fragStream.size + (addPaddingByte ? 1 : 0)
+          );
           binaryStream.concat(fragStream);
+
+          if (addPaddingByte) {
+              binaryStream.writeInt8(this.padByte);
+          }
         }
       }
+
       stream.writeUint16(0xfffe);
       stream.writeUint16(0xe000);
       stream.writeUint32(startOffset.length * 4);
       for (var i = 0; i < startOffset.length; i++) {
-        stream.writeUint32(startOffset[i]);
+          stream.writeUint32(startOffset[i]);
       }
       stream.concat(binaryStream);
       stream.writeUint16(0xfffe);
       stream.writeUint16(0xe0dd);
       stream.writeUint32(0x0);
-      var written = 8 + binaryStream.size + startOffset.length * 4 + 8;
 
-      if (written & 1) {
-        stream.writeHex(this.padByte);
-        written++;
-      }
       return 0xffffffff;
+
     } else {
       var binaryData = value[0],
         binaryStream = new ReadBufferStream(binaryData);
@@ -381,86 +432,134 @@ export class BinaryRepresentation extends ValueRepresentation<ArrayBuffer> {
 
   readBytes(
     stream: BufferStream,
-    length: number,
-    _syntax: NormalizedSyntax
+    length: number
   ): Array<ArrayBuffer> {
-    if (length == 0xffffffff) {
-      var itemTagValue = Tag.readTag(stream),
-        frames: Array<any> = [];
-      /**
-       * There are three special SQ related Data Elements that are not ruled by the VR encoding rules conveyed
-       * by the Transfer Syntax. They shall be encoded as Implicit VR. These special Data Elements are Item (FFFE,E000),
-       * Item Delimitation Item (FFFE,E00D), and Sequence Delimitation Item (FFFE,E0DD).
-       * However, the Data Set within the Value Field of the Data Element Item (FFFE,E000) shall be encoded according
-       * to the rules conveyed by the Transfer Syntax.
-       *
-       * ^^^ Not sure what this means but here we are handling FFFE E000
-       */
-      if (itemTagValue.is(0xfffee000)) {
-        var itemLength = stream.readUint32(),
-          numOfFrames = 1,
-          offsets: Array<number> = [];
-        if (itemLength > 0x0) {
-          // There are frames (commonly the item length is 4 for a single frame?)
-          numOfFrames = itemLength / 4;
-          var i = 0;
-          while (i++ < numOfFrames) {
-            const offset = stream.readUint32();
-            offsets.push(offset);
-          }
-        } else {
-          offsets = [0];
-        }
-        // At this point I'm assuming offsets start at zero for single frames (through either method).
-        var nextTag = Tag.readTag(stream),
-          fragmentStream: any = null,
-          start = 4,
-          frameOffset = offsets.shift();
-        // Alright, so that means we have a bunch of binary data, encapsulated in a (FFFE,E000) tag.
-        // I think I get it...
-        while (nextTag.is(0xfffee000)) {
-          // I guess this is for starting a new frame?
-          if (frameOffset == start) {
-            frameOffset = offsets.shift();
-            if (fragmentStream !== null) {
-              frames.push(fragmentStream.buffer);
-              fragmentStream = null;
-            }
-          }
-          var frameItemLength = stream.readUint32(),
-            thisStream = stream.more(frameItemLength);
-          // Set the fragment stream to this stream on the first try
-          if (fragmentStream === null) {
-            fragmentStream = thisStream;
-            // FIX! This offset wasn't being set causing us to overwrite the first fragment.
-            fragmentStream.offset = thisStream.size;
+      if (length == 0xffffffff) {
+          var itemTagValue = Tag.readTag(stream),
+              frames = [];
+
+          if (itemTagValue.is(0xfffee000)) {
+              var itemLength = stream.readUint32(),
+                  numOfFrames = 1,
+                  offsets = [];
+              if (itemLength > 0x0) {
+                  //has frames
+                  numOfFrames = itemLength / 4;
+                  var i = 0;
+                  while (i++ < numOfFrames) {
+                      offsets.push(stream.readUint32());
+                  }
+              } else {
+                  offsets = [];
+              }
+
+              const SequenceItemTag = 0xfffee000;
+              const SequenceDelimiterTag = 0xfffee0dd;
+
+              const getNextSequenceItemData = (stream: BufferStream) => {
+                  const nextTag = Tag.readTag(stream);
+                  if (nextTag.is(SequenceItemTag)) {
+                      const itemLength = stream.readUint32();
+                      const buffer = stream.getBuffer(
+                          stream.offset,
+                          stream.offset + itemLength
+                      );
+                      stream.increment(itemLength);
+                      return buffer;
+                  } else if (nextTag.is(SequenceDelimiterTag)) {
+                      // Read SequenceDelimiterItem value for the SequenceDelimiterTag
+                      if (stream.readUint32() !== 0) {
+                          throw Error(
+                              "SequenceDelimiterItem tag value was not zero"
+                          );
+                      }
+                      return null;
+                  }
+
+                  throw Error("Invalid tag in sequence");
+              };
+
+              // If there is an offset table, use that to loop through pixel data sequence
+              if (offsets.length > 0) {
+                  // make offsets relative to the stream, not tag
+                  offsets = offsets.map(e => e + stream.offset);
+                  offsets.push(stream.size);
+
+                  // window offsets to an array of [start,stop] locations
+                  frames = toWindows(offsets, 2).map((range: [any, any]) => {
+                      const fragments = [];
+                      const [start, stop] = range;
+                      // create a new readable stream based on the range
+                      const rangeStream = new ReadBufferStream(
+                          stream.buffer,
+                          stream.isLittleEndian,
+                          {
+                              start: start,
+                              stop: stop,
+                              noCopy: stream.noCopy
+                          }
+                      );
+
+                      let frameSize = 0;
+                      while (!rangeStream.end()) {
+                          const buf = getNextSequenceItemData(rangeStream);
+                          if (buf === null) {
+                              break;
+                          }
+                          fragments.push(buf);
+                          frameSize += buf.byteLength;
+                      }
+
+                      // Ensure the parent stream's offset is kept up to date
+                      stream.offset = rangeStream.offset;
+
+                      // If there's only one buffer thne just return it directly
+                      if (fragments.length === 1) {
+                          return fragments[0];
+                      }
+
+                      if (rangeStream.noCopy) {
+                          // return the fragments for downstream application to process
+                          return fragments;
+                      } else {
+                          // Allocate a final ArrayBuffer and concat all buffers into it
+                          const mergedFrame = new ArrayBuffer(frameSize);
+                          const u8Data = new Uint8Array(mergedFrame);
+                          fragments.reduce((offset, buffer) => {
+                              u8Data.set(new Uint8Array(buffer), offset);
+                              return offset + buffer.byteLength;
+                          }, 0);
+
+                          return mergedFrame;
+                      }
+                  });
+              }
+              // If no offset table, loop through remainder of stream looking for termination tag
+              else {
+                  while (!stream.end()) {
+                      const buffer = getNextSequenceItemData(stream);
+                      if (buffer === null) {
+                          break;
+                      }
+                      frames.push(buffer);
+                  }
+              }
           } else {
-            // For each encapsulted fragment, add it.
-            fragmentStream.concat(thisStream);
+              throw new Error(
+                  "Item tag not found after undefined binary length"
+              );
           }
-          nextTag = Tag.readTag(stream);
-          start += 4 + frameItemLength;
-        }
-        // Then we seem to add the whole stream in as a fragment?
-        if (fragmentStream !== null) {
-          frames.push(fragmentStream.buffer);
-        }
-        // Not sure why we need to read off an extra 32 bits?
-        stream.readUint32();
+          return frames;
       } else {
-        throw new Error("Item tag not found after undefined binary length");
-      }
-      // Send back the frames.
-      return frames;
-    } else {
-      var bytes;
-      /*if (this.type == 'OW') {
-                bytes = stream.readUint16Array(length);
-            } else if (this.type == 'OB') {
-                bytes = stream.readUint8Array(length);
-            }*/
-      bytes = stream.more(length).buffer;
-      return [bytes];
+          var bytes;
+          /*if (this.type == 'OW') {
+              bytes = stream.readUint16Array(length);
+          } else if (this.type == 'OB') {
+              bytes = stream.readUint8Array(length);
+          }*/
+          bytes = stream.getBuffer(stream.offset, stream.offset + length);
+          stream.increment(length);
+          return [bytes];
     }
   }
 }

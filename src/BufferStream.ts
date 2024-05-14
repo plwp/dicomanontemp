@@ -54,7 +54,7 @@ export class BufferStream {
   view: DataView;
   offset: number;
   isLittleEndian: boolean;
-  constructor(sizeOrBuffer: number | ArrayBuffer, littleEndian: boolean) {
+  constructor(sizeOrBuffer: number | ArrayBuffer, littleEndian: boolean | null) {
     this.buffer =
       typeof sizeOrBuffer == "number"
         ? new ArrayBuffer(sizeOrBuffer)
@@ -288,13 +288,14 @@ export class BufferStream {
   }
 
   more(length: number): ReadBufferStream {
-    if (this.offset + length > this.buffer.byteLength) {
-      throw new Error("Request more than currently allocated buffer");
-    }
-
-    var newBuf = this.buffer.slice(this.offset, this.offset + length);
+    const newBuf = new ReadBufferStream(this.buffer, null, {
+        start: this.offset,
+        stop: this.offset + length,
+        noCopy: false
+    });
     this.increment(length);
-    return new ReadBufferStream(newBuf);
+
+    return newBuf;
   }
 
   reset() {
@@ -311,10 +312,56 @@ export class BufferStream {
   }
 }
 
-export class ReadBufferStream extends BufferStream {
-  constructor(buffer: ArrayBuffer, littleEndian: boolean = false) {
-    super(buffer, littleEndian);
-    this.size = this.buffer.byteLength;
+class ReadBufferStream extends BufferStream {
+  noCopy: boolean;
+  startOffset: number;
+  endOffset: number;
+  decoder: TextDecoder;
+  constructor(
+      buffer: ArrayBuffer,
+      littleEndian: boolean | null,
+      options = {
+          start: 0,
+          stop: buffer.byteLength,
+          noCopy: false
+      }
+  ) {
+      super(buffer, littleEndian);
+      this.offset = options.start || 0;
+      this.size = options.stop || this.buffer.byteLength;
+      this.noCopy = options.noCopy;
+      this.startOffset = this.offset;
+      this.endOffset = this.size;
+      this.decoder = new TextDecoder("latin1");
+  }
+
+  setDecoder(decoder: any) {
+      this.decoder = decoder;
+  }
+
+  getBuffer(start: number, end: number) {
+      if (this.noCopy) {
+          return new Uint8Array(this.buffer, start, end - start);
+      }
+      if (!start && !end) {
+          start = 0;
+          end = this.size;
+      }
+
+      return this.buffer.slice(start, end);
+  }
+
+  reset() {
+      this.offset = this.startOffset;
+      return this;
+  }
+
+  end() {
+      return this.offset >= this.endOffset;
+  }
+
+  toEnd() {
+      this.offset = this.endOffset;
   }
 }
 
